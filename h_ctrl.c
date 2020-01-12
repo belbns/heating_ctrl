@@ -28,6 +28,10 @@ static void gpio_setup(void);
 static void usart_setup(void);
 static void dma_write(void);
 static void adc_setup(void);
+static void tim2_setup(void);
+
+uint64_t millis(void);
+void delay(uint64_t duration);
 
 //static void adc_calc(void);
 static void make_pack(void);
@@ -100,7 +104,10 @@ int main(void)
     clock_setup();
     systick_setup();
     gpio_setup();
+    gpio_clear(AM2320_PORT, AM2320_PIN1);
+    gpio_clear(AM2320_PORT, AM2320_PIN2);
     adc_setup();
+    tim2_setup();
     usart_setup();
 
     while (1)
@@ -109,6 +116,10 @@ int main(void)
     	{
     		adc_scanning = 1;
             channel_array[0] = 3;
+            adc_power_off(ADC1);
+            adc_set_regular_sequence(ADC1, 1, channel_array);
+            adc_power_on(ADC1);
+            delay(20);
     		adc_start_conversion_regular(ADC1);
             while (!(adc_eoc(ADC1)));
             vcc1 = adc_read_regular(ADC1);
@@ -116,8 +127,12 @@ int main(void)
             adc_start_conversion_regular(ADC1);
             while (!(adc_eoc(ADC1)));
             vcc = adc_read_regular(ADC1);
-            delay(20);
-            channel_array[0] = 3;
+            //delay(20);
+            channel_array[0] = 7;
+            adc_power_off(ADC1);
+            adc_set_regular_sequence(ADC1, 1, channel_array);
+            adc_power_on(ADC1);
+			delay(20);
             adc_start_conversion_regular(ADC1);
             while (!(adc_eoc(ADC1)));
             pressure1 = adc_read_regular(ADC1);
@@ -125,6 +140,12 @@ int main(void)
             adc_start_conversion_regular(ADC1);
             while (!(adc_eoc(ADC1)));
             pressure = adc_read_regular(ADC1);
+            adc_scanning = 0;
+            delay(20);
+
+            am2320_recv(AM2320_PIN1);
+			delay(20);
+
     	}
     	else
     	{
@@ -136,7 +157,7 @@ int main(void)
     			dma_write();
     		}
     	}
-    	delay(1000);
+    	delay(100);
 	}
 }
 
@@ -145,7 +166,7 @@ static uint16_t get_us_value(uint8_t state, uint16_t pin)
     timer_set_counter(TIM2, 0);
     timer_enable_counter(TIM2);
     uint16_t count = 0;
-    while ((gpio_get(GPIOA, pin) == state) && (count < 65535))
+    while ((gpio_get(GPIOA, pin) == state) && (count < 60000))
     {
         count = timer_get_counter(TIM2);
     }
@@ -199,7 +220,9 @@ static uint8_t am2320_recv(uint16_t s_pin)
             buf[b] |= (get_us_value(1, s_pin) > cnt) << (7 - i); 
         } 
     } 
-    
+    delay(20); 
+	gpio_clear(AM2320_PORT, s_pin);    
+
     // проверяем контрольную сумму 
     if (buf[4] != (buf[0] + buf[1] + buf[2] + buf[3]))
     {
@@ -322,8 +345,9 @@ static void tim2_setup(void) {
     rcc_periph_reset_pulse(RST_TIM2);
     timer_set_mode(TIM2, TIM_CR1_CKD_CK_INT, TIM_CR1_CMS_EDGE, TIM_CR1_DIR_UP);
     timer_set_prescaler(TIM2, 48 - 1);
-    timer_enable_preload(TIM2);
+    timer_disable_preload(TIM2);
     timer_set_period(TIM2, 65535);  // ARR
+    timer_disable_counter(TIM2);
     //timer_generate_event(TIM2, TIM_EGR_UG); // 1-st Update Event
 }
 
