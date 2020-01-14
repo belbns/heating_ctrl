@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 
 #include <libopencm3/stm32/gpio.h>
 #include <libopencm3/stm32/f0/gpio.h>
@@ -22,24 +23,6 @@
 #include <libopencm3/stm32/f0/timer.h>
 #include <libopencm3/stm32/adc.h>
 
-static void clock_setup(void);
-static void systick_setup(void);
-static void gpio_setup(void);
-static void usart_setup(void);
-static void dma_write(void);
-static void adc_setup(void);
-static void tim2_setup(void);
-
-uint64_t millis(void);
-void delay(uint64_t duration);
-
-//static void adc_calc(void);
-static void make_pack(void);
-static uint16_t get_us_value(uint8_t state, uint16_t pin);
-static uint8_t am2320_recv(uint16_t s_pin);
-
-char * itoa_m(int val, int base);
-
 typedef struct {
     union {
         uint16_t humidity;  // влажность
@@ -49,7 +32,27 @@ typedef struct {
         uint16_t temper;  // температура
         uint8_t temp[2];
     };
-} am3220_s;
+} am2320_s;
+
+
+static void clock_setup(void);
+static void systick_setup(void);
+static void gpio_setup(void);
+static void usart_setup(void);
+static void dma_write(void);
+static void adc_setup(void);
+static void tim16_setup(void);
+
+uint64_t millis(void);
+void delay(uint64_t duration);
+
+//static void adc_calc(void);
+static void make_pack(void);
+static uint16_t am2320_recv(am2320_s * ds, uint16_t s_pin);
+
+uint16_t get_us_value(bool state, uint16_t cnt, uint16_t pin);
+
+char * itoa_m(int val, int base);
 
 
 #define AM2320_PORT GPIOA
@@ -57,8 +60,9 @@ typedef struct {
 #define AM2320_PIN2 GPIO6
 #define PACK_SZ	20
 
-am3220_s pre_value = {{0}, {0}};
-am3220_s new_value = {{0}, {0}};
+am2320_s ds_air = {{0}, {0}};
+am2320_s ds_bat = {{0}, {0}};
+static volatile am2320_s ds_tmp = {{0}, {0}};
 
 char sndbuf[PACK_SZ + 4];
 char rxbuff[PACK_SZ + 4];
@@ -83,51 +87,47 @@ int16_t pressure1 = 0;
 int16_t vcc = 0;
 int16_t vcc1 = 0;
 
-static volatile uint64_t _millis = 0;
+uint16_t res = 0;
+static volatile uint16_t Tbe = 0;
+static volatile uint16_t Tgo = 0;
+static volatile uint16_t Trel = 0;
+static volatile uint16_t Treh = 0;
 
-uint64_t millis(void) {
-    return _millis;
-}
-
-void sys_tick_handler(void) {
-    _millis++;
-}
-
-void delay(uint64_t duration) {
-    const uint64_t until = millis() + duration;
-    while (millis() < until) ;
-}
-
+static volatile uint16_t test1 = 0;
+static volatile uint16_t test2 = 0;
+static volatile uint16_t test3 = 0;
 
 int main(void)
 {
     clock_setup();
     systick_setup();
     gpio_setup();
-    gpio_clear(AM2320_PORT, AM2320_PIN1);
-    gpio_clear(AM2320_PORT, AM2320_PIN2);
+    gpio_set(AM2320_PORT, AM2320_PIN1);
+    gpio_set(AM2320_PORT, AM2320_PIN2);
     adc_setup();
-    tim2_setup();
+    tim16_setup();
     usart_setup();
+    delay(500);
 
     while (1)
     {
     	if (adc_scanning == 0)
     	{
     		adc_scanning = 1;
-            channel_array[0] = 3;
-            adc_power_off(ADC1);
-            adc_set_regular_sequence(ADC1, 1, channel_array);
-            adc_power_on(ADC1);
-            delay(20);
+            //channel_array[0] = 3;
+            //adc_power_off(ADC1);
+            //adc_set_regular_sequence(ADC1, 1, channel_array);
+            //adc_power_on(ADC1);
+            //delay(20);
     		adc_start_conversion_regular(ADC1);
-            while (!(adc_eoc(ADC1)));
-            vcc1 = adc_read_regular(ADC1);
-            delay(20);
-            adc_start_conversion_regular(ADC1);
             while (!(adc_eoc(ADC1)));
             vcc = adc_read_regular(ADC1);
             //delay(20);
+            //adc_start_conversion_regular(ADC1);
+            while (!(adc_eoc(ADC1)));
+            pressure = adc_read_regular(ADC1);
+            //delay(20);
+            /*
             channel_array[0] = 7;
             adc_power_off(ADC1);
             adc_set_regular_sequence(ADC1, 1, channel_array);
@@ -140,12 +140,9 @@ int main(void)
             adc_start_conversion_regular(ADC1);
             while (!(adc_eoc(ADC1)));
             pressure = adc_read_regular(ADC1);
+            */
             adc_scanning = 0;
             delay(20);
-
-            am2320_recv(AM2320_PIN1);
-			delay(20);
-
     	}
     	else
     	{
@@ -157,86 +154,113 @@ int main(void)
     			dma_write();
     		}
     	}
-    	delay(100);
+
+        res = am2320_recv(&ds_air, AM2320_PIN1);
+        res = am2320_recv(&ds_bat, AM2320_PIN2);
+        delay(200);
 	}
 }
 
-static uint16_t get_us_value(uint8_t state, uint16_t pin)
+uint16_t get_us_value(bool state, uint16_t cnt, uint16_t pin)
 {
-    timer_set_counter(TIM2, 0);
-    timer_enable_counter(TIM2);
-    uint16_t count = 0;
-    while ((gpio_get(GPIOA, pin) == state) && (count < 60000))
+    uint16_t tb = timer_get_counter(TIM16);
+    uint16_t d = 0;
+    while (((gpio_get(AM2320_PORT, pin) != 0) == state) && (d < cnt))
     {
-        count = timer_get_counter(TIM2);
-    }
-    timer_disable_counter(TIM2);
-    return count;
+        uint16_t tc = timer_get_counter(TIM16);
+        if (tc < tb)
+        {
+            d = 0xffff - tb + tc;
+        }
+        else
+        {
+            d = tc - tb;
+        }
+    };
+
+    return d;
 }
 
-//Источник: https://terraideas.ru/article/podklyuchenie-dht11-i-dht22-k-stm32f103c8t6-4
-static uint8_t am2320_recv(uint16_t s_pin)
+static uint16_t am2320_recv(am2320_s * ds, uint16_t s_pin)
 {   
     uint8_t buf[5];
-    uint8_t cnt; 
-    // Поднимем ногу датчика к питанию на некоторое время, что бы датчик начал работать 
+    uint16_t tcnt = 0; 
+    uint16_t result = 0;
+
+    // Поднимем ногу датчика к питанию для включения режима 
     gpio_set(AM2320_PORT, s_pin);
     delay(100); 
-    // прижмем к земле на 20mS
+    // прижимаем пин к земле на 5mS - "Tbe"
     gpio_clear(AM2320_PORT, s_pin);    
-    delay(20); 
-    // отпустим ногу 
+    delay(5); 
+    // отпустим пин 
     gpio_set(AM2320_PORT, s_pin);
-    // датчик не сразу прижимает ногу в 0 
-    // поэтому ждем некоторое время 
-    get_us_value(1, s_pin); // 20..200 uS
-    // теперь, когда нога прижата, ждем пока она прижата 
-    // 5 тут просто для того что бы убедится что прошло минимум 5 мкс 
-    if (get_us_value(0, s_pin) < 5) // 75..85 uS ?
+    // ждем появления нуля  - "Tgo"
+    tcnt = get_us_value(true, 200, s_pin); // 20..200 uS
+    Tgo = tcnt;
+    if (tcnt < 200) // дождались 0 от AM2320 - Trel началось
     {
-        return 1; 
-    }
-    // теперь ждем пока нога поднята 
-    if (get_us_value(1, s_pin) < 5) // 75..85 uS ?
-    { 
-        return 1;
-    }
-    // импульс присутствия датчика получен 
-    // значит нужно начинать получать наши биты 
-    // цикл по размеру массива 
-    for (uint8_t b = 0; b < 5; b++)
-    { 
-        // получаем 8 бит в очередной байт 
-        buf[b] = 0;
-        for (uint8_t i = 0; i < 8; i++)
-        { 
-            //получаем время на сколько нога была прижата к 0 
-            cnt = get_us_value(0, s_pin); // 48..55 uS
-            // теперь получаем сколько нога прижата к 1 
-            // 0: 22..30 uS, 1: 68..75 uS
-            // если к 1 прижата дольше (>) значит пришла единица 
-            // если нет то пришел 0 
-            // и пишем это в нашу структуру 
-            buf[b] |= (get_us_value(1, s_pin) > cnt) << (7 - i); 
-        } 
-    } 
-    delay(20); 
-	gpio_clear(AM2320_PORT, s_pin);    
+        tcnt = get_us_value(false, 200, s_pin); // ждем окончания Trel: 75..85 uS
+        Trel = tcnt;
+        if (tcnt < 200) // Trel закончилось, дождались Treh
+        {
+            // теперь ждем пока Treh закончится
+            tcnt = get_us_value(true, 200, s_pin);
+            Treh = tcnt;
+            if (tcnt < 200) // 75..85 uS ?
+            {
+                // Treh получен 
+                // получать данные - Tlow + Th[0|1] 
+                // цикл по размеру массива 
+                for (uint8_t b = 0; b < 5; b++)
+                { 
+                    // получаем 8 бит в очередной байт 
+                    buf[b] = 0;
+                    for (uint8_t i = 0; i < 8; i++)
+                    { 
+                        // измеряем Tlow
+                        uint16_t cnt_l = get_us_value(false, 100, s_pin); // 48..55 uS
+                        // измеряем Th[0|1]
+                        uint16_t cnt_h = get_us_value(true, 150, s_pin); // 0: 22..30 uS, 1: 68..75 uS
+                        if (cnt_h > cnt_l) // пришла "1" (Th1) - пишем бит в буфер
+                        {
+                            buf[b] |= (1 << (7 - i));
+                        }
+                    } 
+                } 
 
-    // проверяем контрольную сумму 
-    if (buf[4] != (buf[0] + buf[1] + buf[2] + buf[3]))
-    {
-        return 1; 
+                // контрольная сумма 
+                if (buf[4] == ((buf[0] + buf[1] + buf[2] + buf[3]) & 0xff))
+                {
+                    ds->hum[1] = buf[0];
+                    ds->hum[0] = buf[1];
+                    ds->temp[1] = buf[2];
+                    ds->temp[0] = buf[3];
+                }
+                else
+                {
+                    result = 14000; // не совпала контрольная сумма
+                }
+            }
+            else
+            {
+                result = 13000 + tcnt;  // нет Tlow
+            }
+        }
+        else
+        {
+            result = 12000 + tcnt;  // нет Treh
+        }
     }
     else
     {
-        new_value.hum[1] = buf[0];
-        new_value.hum[0] = buf[1];
-        new_value.temp[1] = buf[2];
-        new_value.temp[0] = buf[3];
-        return 0; 
+        result = 11000 + tcnt;  // нет Trel
     }
+
+    return result;
 } 
+
+
 
 /*
 static void adc_calc(void)
@@ -251,9 +275,9 @@ static void adc_calc(void)
 static void make_pack(void)
 {
 	strcpy(sndbuf, "A");
-	strcat(sndbuf, itoa_m(t_air, 10));
+	strcat(sndbuf, itoa_m(ds_air.temper, 10));
 	strcat(sndbuf, "B");
-	strcat(sndbuf, itoa_m(t_bat, 10));
+	strcat(sndbuf, itoa_m(ds_bat.temper, 10));
 	strcat(sndbuf, "P");
 	strcat(sndbuf, itoa_m(pressure, 10));
 	strcat(sndbuf, "V");
@@ -289,9 +313,22 @@ char * itoa_m(int val, int base) {
 }
 
 // =================================================================
+static volatile uint64_t _millis = 0;
+
+uint64_t millis(void) {
+    return _millis;
+}
+
+void sys_tick_handler(void) {
+    _millis++;
+}
+
+void delay(uint64_t duration) {
+    const uint64_t until = millis() + duration;
+    while (millis() < until) ;
+}
 
 static void clock_setup(void) {
-    //rcc_clock_setup_in_hse_8mhz_out_48mhz();
     rcc_clock_setup_in_hsi_out_48mhz();
     rcc_periph_clock_enable(RCC_GPIOA);
     rcc_periph_clock_enable(RCC_GPIOB);
@@ -316,9 +353,11 @@ static void gpio_setup(void) {
     // PWRC
     gpio_mode_setup(GPIOA, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO1);
     // AM2320 - T_Air, H_Air
-    gpio_mode_setup(GPIOA, GPIO_OTYPE_OD, GPIO_PUPD_NONE, GPIO5);
+    gpio_mode_setup(GPIOA, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO5);
+    gpio_set_output_options(GPIOA, GPIO_OTYPE_OD, GPIO_OSPEED_MED, GPIO5);
     // AM2320 - T_Bat, H_Bat
-    gpio_mode_setup(GPIOA, GPIO_OTYPE_OD, GPIO_PUPD_NONE, GPIO6);
+    gpio_mode_setup(GPIOA, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO6);
+    gpio_set_output_options(GPIOA, GPIO_OTYPE_OD, GPIO_OSPEED_MED, GPIO6);
 
     // STAT input
     nvic_enable_irq(NVIC_EXTI0_1_IRQ);
@@ -339,16 +378,16 @@ static void gpio_setup(void) {
 }
 
 // measuring ir signal period
-static void tim2_setup(void) {
-    rcc_periph_clock_enable(RCC_TIM2);
+static void tim16_setup(void) {
+    rcc_periph_clock_enable(RCC_TIM16);
 
-    rcc_periph_reset_pulse(RST_TIM2);
-    timer_set_mode(TIM2, TIM_CR1_CKD_CK_INT, TIM_CR1_CMS_EDGE, TIM_CR1_DIR_UP);
-    timer_set_prescaler(TIM2, 48 - 1);
-    timer_disable_preload(TIM2);
-    timer_set_period(TIM2, 65535);  // ARR
-    timer_disable_counter(TIM2);
-    //timer_generate_event(TIM2, TIM_EGR_UG); // 1-st Update Event
+    rcc_periph_reset_pulse(RST_TIM16);
+    timer_set_mode(TIM16, TIM_CR1_CKD_CK_INT, TIM_CR1_CMS_EDGE, TIM_CR1_DIR_UP);
+    timer_continuous_mode(TIM16);
+    timer_set_prescaler(TIM16, 48 - 1);
+    timer_enable_preload(TIM16);
+    timer_set_period(TIM16, 0xffff);  // ARR
+    timer_enable_counter(TIM16);
 }
 
 static void adc_setup(void)
@@ -361,7 +400,7 @@ static void adc_setup(void)
     adc_set_right_aligned(ADC1);
     adc_enable_temperature_sensor();
     adc_set_sample_time_on_all_channels(ADC1, ADC_SMPTIME_071DOT5);
-    adc_set_regular_sequence(ADC1, 1, channel_array);
+    adc_set_regular_sequence(ADC1, 2, channel_array);
     adc_set_resolution(ADC1, ADC_RESOLUTION_12BIT);
     adc_disable_analog_watchdog(ADC1);
     adc_power_on(ADC1);
