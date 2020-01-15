@@ -67,27 +67,32 @@ static volatile am2320_s ds_tmp = {{0}, {0}};
 char sndbuf[PACK_SZ + 4];
 char rxbuff[PACK_SZ + 4];
 char cmdbuff[PACK_SZ + 4];
-uint8_t channel_array[] = {3, 7};
+uint8_t channel_array[] = {3, 7, 18};
 
+uint8_t pack_count = 0;
 
 uint8_t rxindex = 0;
 uint8_t flag_cmd = 0;
 uint8_t transmit = 0;
-uint8_t ble_connected = 0;
+bool ble_connected = false;
+bool trans_en = false;
+
 uint16_t pwm_count = 0;
 uint8_t	adc_scanning = 0;  
 uint8_t adc_error = 0;  
 uint8_t adc_new_val = 0;
 
-int16_t t_air = 0;
-int16_t t_bat = 0;
-//int16_t t_chip = 0;
-int16_t pressure = 0;
-int16_t pressure1 = 0;
-int16_t vcc = 0;
-int16_t vcc1 = 0;
+static volatile int16_t t_air = 0;
+static volatile int16_t t_bat = 0;
+static volatile int16_t t_chip = 0;
+static volatile int16_t pressure = 0;
+static volatile int16_t pressure1 = 0;
+static volatile int16_t vcc = 0;
+static volatile int16_t vbat = 0;
+static volatile int16_t vcc1 = 0;
 
 uint16_t res = 0;
+/*
 static volatile uint16_t Tbe = 0;
 static volatile uint16_t Tgo = 0;
 static volatile uint16_t Trel = 0;
@@ -96,7 +101,7 @@ static volatile uint16_t Treh = 0;
 static volatile uint16_t test1 = 0;
 static volatile uint16_t test2 = 0;
 static volatile uint16_t test3 = 0;
-
+*/
 int main(void)
 {
     clock_setup();
@@ -111,53 +116,50 @@ int main(void)
 
     while (1)
     {
-    	if (adc_scanning == 0)
-    	{
-    		adc_scanning = 1;
-            //channel_array[0] = 3;
-            //adc_power_off(ADC1);
-            //adc_set_regular_sequence(ADC1, 1, channel_array);
-            //adc_power_on(ADC1);
-            //delay(20);
-    		adc_start_conversion_regular(ADC1);
-            while (!(adc_eoc(ADC1)));
-            vcc = adc_read_regular(ADC1);
-            //delay(20);
-            //adc_start_conversion_regular(ADC1);
-            while (!(adc_eoc(ADC1)));
-            pressure = adc_read_regular(ADC1);
-            //delay(20);
-            /*
-            channel_array[0] = 7;
-            adc_power_off(ADC1);
-            adc_set_regular_sequence(ADC1, 1, channel_array);
-            adc_power_on(ADC1);
-			delay(20);
-            adc_start_conversion_regular(ADC1);
-            while (!(adc_eoc(ADC1)));
-            pressure1 = adc_read_regular(ADC1);
-            delay(20);
-            adc_start_conversion_regular(ADC1);
-            while (!(adc_eoc(ADC1)));
-            pressure = adc_read_regular(ADC1);
-            */
-            adc_scanning = 0;
-            delay(20);
-    	}
-    	else
-    	{
-    		if ((adc_new_val == 1) && ble_connected)
-    		{
-    			//adc_calc();
-    			make_pack();
-    			while (transmit) {};
-    			dma_write();
-    		}
-    	}
+    	adc_scanning = 1;
+    	adc_start_conversion_regular(ADC1);
+        while (!(adc_eoc(ADC1)));
+        vcc = adc_read_regular(ADC1);
+        while (!(adc_eoc(ADC1)));
+        pressure = adc_read_regular(ADC1);
+        while (!(adc_eoc(ADC1)));
+        vbat = adc_read_regular(ADC1) * 2;
+        adc_scanning = 0;
 
         res = am2320_recv(&ds_air, AM2320_PIN1);
         res = am2320_recv(&ds_bat, AM2320_PIN2);
+
+        if (trans_en)
+        {
+            while (transmit) {};
+            if (ble_connected)
+            {
+              make_pack();
+              dma_write();                
+            }
+            else
+            {
+                trans_en = false;
+            }
+        }
+        else
+        {
+            if (ble_connected)
+            {
+                delay(500);
+                if (ble_connected)
+                {
+                    trans_en = true;
+                }
+            }            
+        }
+
         delay(200);
+
+        //pwr_set_stop_mode();
+        //__WFI();
+        //reset_clocks();
+ 
 	}
 }
 
@@ -197,16 +199,16 @@ static uint16_t am2320_recv(am2320_s * ds, uint16_t s_pin)
     gpio_set(AM2320_PORT, s_pin);
     // ждем появления нуля  - "Tgo"
     tcnt = get_us_value(true, 200, s_pin); // 20..200 uS
-    Tgo = tcnt;
+    //Tgo = tcnt;
     if (tcnt < 200) // дождались 0 от AM2320 - Trel началось
     {
         tcnt = get_us_value(false, 200, s_pin); // ждем окончания Trel: 75..85 uS
-        Trel = tcnt;
+        //Trel = tcnt;
         if (tcnt < 200) // Trel закончилось, дождались Treh
         {
             // теперь ждем пока Treh закончится
             tcnt = get_us_value(true, 200, s_pin);
-            Treh = tcnt;
+            //Treh = tcnt;
             if (tcnt < 200) // 75..85 uS ?
             {
                 // Treh получен 
@@ -274,14 +276,16 @@ static void adc_calc(void)
 */
 static void make_pack(void)
 {
-	strcpy(sndbuf, "A");
+	strcpy(sndbuf, "N");
+    strcat(sndbuf, itoa_m(pack_count++, 16));
+    strcat(sndbuf, "A");
 	strcat(sndbuf, itoa_m(ds_air.temper, 10));
 	strcat(sndbuf, "B");
 	strcat(sndbuf, itoa_m(ds_bat.temper, 10));
 	strcat(sndbuf, "P");
 	strcat(sndbuf, itoa_m(pressure, 10));
 	strcat(sndbuf, "V");
-	strcat(sndbuf, itoa_m(vcc, 10));
+	strcat(sndbuf, itoa_m(vbat, 10));
 	strcat(sndbuf, "\n");
 }
 
@@ -335,6 +339,11 @@ static void clock_setup(void) {
     rcc_periph_clock_enable(RCC_USART1);
     rcc_periph_clock_enable(RCC_DMA);
     rcc_periph_clock_enable(RCC_ADC);
+
+    // смысл тот же, что и включение тактирования AFIO в STM32F103
+    // без этого прерывание по PB1 не работает,
+    // спасибо andrey_spb (https://radiokot.ru/forum/viewtopic.php?f=59&t=126219)
+    RCC_APB2ENR |=RCC_APB2ENR_SYSCFGCOMPEN;// тактирование SYSCFG
 }
 
 static void systick_setup(void) {
@@ -400,7 +409,7 @@ static void adc_setup(void)
     adc_set_right_aligned(ADC1);
     adc_enable_temperature_sensor();
     adc_set_sample_time_on_all_channels(ADC1, ADC_SMPTIME_071DOT5);
-    adc_set_regular_sequence(ADC1, 2, channel_array);
+    adc_set_regular_sequence(ADC1, 3, channel_array);
     adc_set_resolution(ADC1, ADC_RESOLUTION_12BIT);
     adc_disable_analog_watchdog(ADC1);
     adc_power_on(ADC1);
@@ -508,17 +517,17 @@ void usart1_isr(void)
     
 void exti0_1_isr(void)
 {
-     if (exti_get_flag_status(EXTI1) != 0)
+    if (exti_get_flag_status(EXTI1) != 0)
     {
         exti_reset_request(EXTI1);
-        if ( gpio_get(GPIOB, GPIO1) == 0 )
+        if ( gpio_get(GPIOB, GPIO1) != 0 )
         {
-            // BLE connection is off
-            ble_connected = 0;
+            // BLE connection is on
+            ble_connected = true;
         }
         else
         {
-        	ble_connected = 1;
+        	ble_connected = false;
         }
     }
 }
