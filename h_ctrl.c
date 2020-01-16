@@ -22,6 +22,11 @@
 #include <libopencm3/cm3/nvic.h>
 #include <libopencm3/stm32/f0/timer.h>
 #include <libopencm3/stm32/adc.h>
+#include <libopencm3/stm32/pwr.h>
+#include <libopencm3/stm32/dbgmcu.h>
+#include <libopencm3/../libopencmsis/core_cm3.h>
+#include <libopencm3/cm3/scb.h>
+
 
 typedef struct {
     union {
@@ -41,12 +46,13 @@ static void gpio_setup(void);
 static void usart_setup(void);
 static void dma_write(void);
 static void adc_setup(void);
+static void tim14_setup(void);
 static void tim16_setup(void);
 
 uint64_t millis(void);
 void delay(uint64_t duration);
 
-//static void adc_calc(void);
+void RTC_sets(RTC_struct *value);
 static void make_pack(void);
 static uint16_t am2320_recv(am2320_s * ds, uint16_t s_pin);
 
@@ -58,16 +64,38 @@ char * itoa_m(int val, int base);
 #define AM2320_PORT GPIOA
 #define AM2320_PIN1 GPIO5
 #define AM2320_PIN2 GPIO6
+#define PWRC_PORT   GPIOA
+#define PWRC_PIN    GPIO1 // 0 - для ввода AT команд в режиме соединения
+
 #define PACK_SZ	20
+
+#define DEBUG
+
+/*
+// Команды BLE JDY-16
+// пробуждение по соединению
+const char ble_to_sleep[] = "AT+STARTEN1\r\n"; // - default
+ // Broadcast interval = 500mS (0 - 100, 9 - 1000)
+const char ble_bc_interval = "AT+ADVIN4\r\n"; // ADVIN2(300mS) - default 
+// частота PWM (50-25KHz, 1000Hz - default);
+const char ble_pwm_freq = "AT+PWMFRE1000\r\n";
+// заполнение PWM (0-255, 10 - default)
+const char ble_pwm2_pus = "AT+PWM2PUS10\r\n";
+// включение/выключение PWM
+const char ble_pwm_on = "AT+PWMOPEN1\r\n";
+const char ble_pwm_off = "AT+PWMOPEN0\r\n";
+*/
 
 am2320_s ds_air = {{0}, {0}};
 am2320_s ds_bat = {{0}, {0}};
 static volatile am2320_s ds_tmp = {{0}, {0}};
 
+RTC_struct rtc_params = {2020, 1, 0, 1, 0, 0, 0};
+
 char sndbuf[PACK_SZ + 4];
 char rxbuff[PACK_SZ + 4];
 char cmdbuff[PACK_SZ + 4];
-uint8_t channel_array[] = {3, 7, 18};
+uint8_t channel_array[] = {7, 18};
 
 uint8_t pack_count = 0;
 
@@ -92,16 +120,7 @@ static volatile int16_t vbat = 0;
 static volatile int16_t vcc1 = 0;
 
 uint16_t res = 0;
-/*
-static volatile uint16_t Tbe = 0;
-static volatile uint16_t Tgo = 0;
-static volatile uint16_t Trel = 0;
-static volatile uint16_t Treh = 0;
 
-static volatile uint16_t test1 = 0;
-static volatile uint16_t test2 = 0;
-static volatile uint16_t test3 = 0;
-*/
 int main(void)
 {
     clock_setup();
@@ -110,16 +129,29 @@ int main(void)
     gpio_set(AM2320_PORT, AM2320_PIN1);
     gpio_set(AM2320_PORT, AM2320_PIN2);
     adc_setup();
+    tim14_setup();
     tim16_setup();
     usart_setup();
+
+    gpio_set(GPIOA, GPIO3);
+
+#ifdef DEBUG
+    DBGMCU_CR = DBGMCU_CR_STOP;
+#endif
     delay(500);
 
     while (1)
     {
+        gpio_set(GPIOA, GPIO2); // питание на датчики
+
+        nvic_enable_irq(NVIC_EXTI0_1_IRQ);
+        nvic_enable_irq(NVIC_DMA1_CHANNEL2_3_DMA2_CHANNEL1_2_IRQ);
+        nvic_enable_irq(NVIC_USART1_IRQ);
+
+        //gpio_set(GPIOA, GPIO3);
+        delay(500);
     	adc_scanning = 1;
     	adc_start_conversion_regular(ADC1);
-        while (!(adc_eoc(ADC1)));
-        vcc = adc_read_regular(ADC1);
         while (!(adc_eoc(ADC1)));
         pressure = adc_read_regular(ADC1);
         while (!(adc_eoc(ADC1)));
@@ -129,39 +161,65 @@ int main(void)
         res = am2320_recv(&ds_air, AM2320_PIN1);
         res = am2320_recv(&ds_bat, AM2320_PIN2);
 
-        if (trans_en)
+        if (gpio_get(GPIOB, GPIO1) != 0)
         {
-            while (transmit) {};
-            if (ble_connected)
-            {
-              make_pack();
-              dma_write();                
-            }
-            else
-            {
-                trans_en = false;
-            }
+            ble_connected = true;
         }
         else
         {
-            if (ble_connected)
-            {
-                delay(500);
-                if (ble_connected)
-                {
-                    trans_en = true;
-                }
-            }            
+            ble_connected = false;
         }
 
-        delay(200);
+        if (ble_connected)
+        {
+            make_pack();
+            while (transmit) {};
+            if (ble_connected)
+            {
+              dma_write();                
+            }
+            delay(500);
+            gpio_toggle(GPIOA, GPIO3);
+        }
+        else
+        {
+            gpio_clear(GPIOA, GPIO3);
+            gpio_clear(GPIOA, GPIO2);
+            gpio_set(GPIOA, GPIO5);
+            gpio_set(GPIOA, GPIO6);
 
-        //pwr_set_stop_mode();
-        //__WFI();
-        //reset_clocks();
- 
+            timer_disable_oc_output(TIM14, TIM_OC1);
+            timer_disable_break_main_output(TIM14);
+
+            nvic_disable_irq(NVIC_EXTI0_1_IRQ);
+            nvic_disable_irq(NVIC_DMA1_CHANNEL2_3_DMA2_CHANNEL1_2_IRQ);
+            nvic_disable_irq(NVIC_USART1_IRQ);
+
+            exti_reset_request(EXTI0|EXTI1|EXTI2|EXTI3|EXTI4|EXTI5|EXTI6|EXTI7|
+                            EXTI8|EXTI9|EXTI10|EXTI11|EXTI12|EXTI13|EXTI14|EXTI15|
+                            EXTI16|EXTI17|EXTI18|EXTI19|EXTI20|EXTI21|EXTI22|EXTI23|
+                            EXTI24|EXTI25|EXTI26|EXTI27|EXTI28|EXTI29|EXTI30|EXTI31);        
+
+            //pwr_set_stop_mode();
+            PWR_CR &= ~PWR_CR_PDDS;
+            //pwr_clear_wakeup_flag();
+            PWR_CR |= PWR_CR_CWUF;
+            //pwr_voltage_regulator_low_power_in_stop();
+            PWR_CR |= PWR_CR_LPDS;
+            SCB_SCR |=  (SCB_SCR_SLEEPDEEP_Msk);
+            __WFI();
+
+            // Wake up
+            clock_setup();
+            systick_setup();
+            timer_enable_oc_output(TIM14, TIM_OC1);
+            timer_enable_break_main_output(TIM14);
+            gpio_set(GPIOA, GPIO3);
+        }
 	}
 }
+
+// =====================================================================
 
 uint16_t get_us_value(bool state, uint16_t cnt, uint16_t pin)
 {
@@ -262,18 +320,6 @@ static uint16_t am2320_recv(am2320_s * ds, uint16_t s_pin)
     return result;
 } 
 
-
-
-/*
-static void adc_calc(void)
-{
-	t_air = (adc_buff[1] + adc_buff[2]) >> 1;
-	t_bat = (adc_buff[4] + adc_buff[5]) >> 1;
-	pressure = (adc_buff[7] + adc_buff[8]) >> 1;
-	vcc = (adc_buff[10] + adc_buff[11]) >> 1;
-	adc_new_val = 0;
-}
-*/
 static void make_pack(void)
 {
 	strcpy(sndbuf, "N");
@@ -357,10 +403,17 @@ static void systick_setup(void) {
 }
 
 static void gpio_setup(void) {
-    //  Switch
-    gpio_mode_setup(GPIOA, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO0);
+
     // PWRC
+    gpio_set(GPIOA, GPIO1);
     gpio_mode_setup(GPIOA, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO1);
+    //  Switch
+    gpio_clear(GPIOA, GPIO2);
+    gpio_mode_setup(GPIOA, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO2);
+    // LED
+    gpio_clear(GPIOA, GPIO3);
+    gpio_mode_setup(GPIOA, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO3);
+
     // AM2320 - T_Air, H_Air
     gpio_mode_setup(GPIOA, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO5);
     gpio_set_output_options(GPIOA, GPIO_OTYPE_OD, GPIO_OSPEED_MED, GPIO5);
@@ -368,22 +421,46 @@ static void gpio_setup(void) {
     gpio_mode_setup(GPIOA, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO6);
     gpio_set_output_options(GPIOA, GPIO_OTYPE_OD, GPIO_OSPEED_MED, GPIO6);
 
-    // STAT input
     nvic_enable_irq(NVIC_EXTI0_1_IRQ);
+    // PWM input interrupt
+    gpio_mode_setup(GPIOA, GPIO_MODE_INPUT, GPIO_PUPD_NONE, GPIO0);
+    exti_select_source(EXTI0, GPIOA);
+    exti_set_trigger(EXTI0, EXTI_TRIGGER_RISING);
+    exti_enable_request(EXTI0);
+    // STAT input interrupt
     gpio_mode_setup(GPIOB, GPIO_MODE_INPUT, GPIO_PUPD_NONE, GPIO1);
     exti_select_source(EXTI1, GPIOB);
     exti_set_trigger(EXTI1, EXTI_TRIGGER_BOTH);  // falling edge interrupt
     exti_enable_request(EXTI1);
-    // PWM input
-    nvic_enable_irq(NVIC_EXTI4_15_IRQ);
-    gpio_mode_setup(GPIOA, GPIO_MODE_INPUT, GPIO_PUPD_NONE, GPIO4);
-    exti_select_source(EXTI4, GPIOA);
-    exti_set_trigger(EXTI4, EXTI_TRIGGER_RISING);  // falling edge interrupt
-    exti_enable_request(EXTI4);
-
+    // ADC Pressure
     gpio_mode_setup(GPIOA, GPIO_MODE_ANALOG, GPIO_PUPD_NONE, GPIO7);
-    gpio_mode_setup(GPIOA, GPIO_MODE_ANALOG, GPIO_PUPD_NONE, GPIO3);
 
+}
+
+// Сигнал на динамик
+static void tim14_setup(void) {
+    rcc_periph_clock_enable(RCC_TIM14);
+
+    gpio_mode_setup(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO4);
+    gpio_set_af(GPIOA, GPIO_AF4, GPIO4);
+
+    rcc_periph_reset_pulse(RST_TIM14);
+    timer_set_mode(TIM14, TIM_CR1_CKD_CK_INT, TIM_CR1_CMS_EDGE, TIM_CR1_DIR_UP);
+    timer_continuous_mode(TIM14);
+    timer_set_prescaler(TIM14, 48 - 1); // 1MHz
+    timer_disable_preload(TIM14);
+    timer_set_period(TIM14, 2500 - 1);  // 400 Hz
+    timer_enable_oc_preload(TIM14, TIM_OC1);
+    timer_set_oc_mode(TIM14, TIM_OC1, TIM_OCM_PWM1);
+
+    timer_set_oc_polarity_high(TIM14, TIM_OC1);
+    timer_set_oc_idle_state_set(TIM14, TIM_OC1);
+    timer_set_oc_slow_mode(TIM14, TIM_OC1);
+    timer_set_oc_value(TIM14, TIM_OC1, 200);
+    timer_enable_oc_output(TIM14, TIM_OC1);
+    timer_enable_break_main_output(TIM14);
+
+    //timer_enable_counter(TIM14);
 }
 
 // measuring ir signal period
@@ -409,7 +486,7 @@ static void adc_setup(void)
     adc_set_right_aligned(ADC1);
     adc_enable_temperature_sensor();
     adc_set_sample_time_on_all_channels(ADC1, ADC_SMPTIME_071DOT5);
-    adc_set_regular_sequence(ADC1, 3, channel_array);
+    adc_set_regular_sequence(ADC1, 2, channel_array);
     adc_set_resolution(ADC1, ADC_RESOLUTION_12BIT);
     adc_disable_analog_watchdog(ADC1);
     adc_power_on(ADC1);
@@ -441,6 +518,7 @@ void dma1_channel1_isr(void)
 static void usart_setup(void) {
     nvic_set_priority(NVIC_DMA1_CHANNEL2_3_DMA2_CHANNEL1_2_IRQ, 0);
     nvic_enable_irq(NVIC_DMA1_CHANNEL2_3_DMA2_CHANNEL1_2_IRQ);
+    nvic_enable_irq(NVIC_USART1_IRQ);
 
     gpio_mode_setup(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO9);
     gpio_set_af(GPIOA, GPIO_AF1, GPIO9);
@@ -517,7 +595,7 @@ void usart1_isr(void)
     
 void exti0_1_isr(void)
 {
-    if (exti_get_flag_status(EXTI1) != 0)
+    if (exti_get_flag_status(EXTI1) != 0) // BLE STAT input
     {
         exti_reset_request(EXTI1);
         if ( gpio_get(GPIOB, GPIO1) != 0 )
@@ -530,14 +608,10 @@ void exti0_1_isr(void)
         	ble_connected = false;
         }
     }
-}
-
-void exti4_15_isr(void)
-{
-     if (exti_get_flag_status(EXTI4) != 0)
+    else if (exti_get_flag_status(EXTI0) != 0) // BLE pwm input
     {
-        exti_reset_request(EXTI4);
-        if ( gpio_get(GPIOA, GPIO4) == 1 )
+        exti_reset_request(EXTI0);
+        if ( gpio_get(GPIOA, GPIO0) == 1 )
         {
             pwm_count++;
         }

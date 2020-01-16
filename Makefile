@@ -19,6 +19,8 @@
 
 BINARY = h_ctrl
 
+OBJS = rtc.o
+
 LDSCRIPTPR = f0/stm32f03xz4.ld
 
 include Makefile.include
