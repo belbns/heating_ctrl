@@ -6,27 +6,29 @@
 */
 
 #include <errno.h>
-#include <stdint.h>
+//#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
 
 #include <libopencm3/stm32/gpio.h>
-#include <libopencm3/stm32/f0/gpio.h>
+#include <libopencm3/stm32/gpio.h>
 #include <libopencm3/stm32/exti.h>
 #include <libopencm3/cm3/systick.h>
-#include <libopencm3/stm32/f0/dma.h>
-#include <libopencm3/stm32/f0/usart.h>
+#include <libopencm3/stm32/dma.h>
+#include <libopencm3/stm32/usart.h>
 #include <libopencm3/stm32/rcc.h>
 #include <libopencm3/stm32/f0/nvic.h>
 #include <libopencm3/cm3/nvic.h>
-#include <libopencm3/stm32/f0/timer.h>
+#include <libopencm3/stm32/timer.h>
 #include <libopencm3/stm32/adc.h>
 #include <libopencm3/stm32/pwr.h>
+#include <libopencm3/stm32/rtc.h>
 #include <libopencm3/stm32/dbgmcu.h>
 #include <libopencm3/../libopencmsis/core_cm3.h>
 #include <libopencm3/cm3/scb.h>
 
+#include "rtc.h"
 
 typedef struct {
     union {
@@ -44,17 +46,18 @@ static void clock_setup(void);
 static void systick_setup(void);
 static void gpio_setup(void);
 static void usart_setup(void);
-static void dma_write(void);
+static void dma_write(char * buf);
 static void adc_setup(void);
 static void tim14_setup(void);
 static void tim16_setup(void);
+static void rtc_isr_setup(void);
 
 uint64_t millis(void);
 void delay(uint64_t duration);
 
-void RTC_sets(RTC_struct *value);
-static void make_pack(void);
-static uint16_t am2320_recv(am2320_s * ds, uint16_t s_pin);
+void make_pack(void);
+uint16_t am2320_recv(am2320_s * ds, uint16_t s_pin);
+void set_new_alarm(void);
 
 uint16_t get_us_value(bool state, uint16_t cnt, uint16_t pin);
 
@@ -71,26 +74,27 @@ char * itoa_m(int val, int base);
 
 #define DEBUG
 
-/*
+
 // Команды BLE JDY-16
 // пробуждение по соединению
 const char ble_to_sleep[] = "AT+STARTEN1\r\n"; // - default
  // Broadcast interval = 500mS (0 - 100, 9 - 1000)
-const char ble_bc_interval = "AT+ADVIN4\r\n"; // ADVIN2(300mS) - default 
+const char ble_bc_interval[] = "AT+ADVIN4\r\n"; // ADVIN2(300mS) - default 
 // частота PWM (50-25KHz, 1000Hz - default);
-const char ble_pwm_freq = "AT+PWMFRE1000\r\n";
+const char ble_pwm_freq[] = "AT+PWMFRE1000\r\n";
 // заполнение PWM (0-255, 10 - default)
-const char ble_pwm2_pus = "AT+PWM2PUS10\r\n";
+const char ble_pwm2_pus[] = "AT+PWM2PUS10\r\n";
 // включение/выключение PWM
-const char ble_pwm_on = "AT+PWMOPEN1\r\n";
-const char ble_pwm_off = "AT+PWMOPEN0\r\n";
-*/
+const char ble_pwm_on[] = "AT+PWMOPEN1\r\n";
+const char ble_pwm_off[] = "AT+PWMOPEN0\r\n";
+const char ble_dis[] = "AT+DISC\r\n";
 
-am2320_s ds_air = {{0}, {0}};
-am2320_s ds_bat = {{0}, {0}};
-static volatile am2320_s ds_tmp = {{0}, {0}};
+am2320_s ds_air = {.humidity = 0, .temper =0};
+am2320_s ds_bat = {.humidity = 0, .temper =0};
+am2320_s ds_tmp = {.humidity = 0, .temper =0};
 
-RTC_struct rtc_params = {2020, 1, 0, 1, 0, 0, 0};
+RTC_struct rtc_params = {.year = 20, .month = 1, .week = 3, .day = 1, 
+                            .hour = 0, .minutes = 0, .seconds = 0};
 
 char sndbuf[PACK_SZ + 4];
 char rxbuff[PACK_SZ + 4];
@@ -123,103 +127,159 @@ uint16_t res = 0;
 
 int main(void)
 {
+    uint64_t ms1 = 0;
+    uint64_t ms2 = 0;
+
     clock_setup();
     systick_setup();
     gpio_setup();
     gpio_set(AM2320_PORT, AM2320_PIN1);
     gpio_set(AM2320_PORT, AM2320_PIN2);
+    gpio_set(GPIOA, GPIO1); // PWRC
     adc_setup();
     tim14_setup();
     tim16_setup();
     usart_setup();
+    RTC_init();
+    /*
+    if( !(RTC_ISR & RTC_ISR_INITS) )  // Часы не настроены
+    {
+        RTC_sets(&rtc_params);
+    }
+    */
+    RTC_sets(&rtc_params);
+    set_new_alarm();
+    rtc_isr_setup();
 
-    gpio_set(GPIOA, GPIO3);
-
-#ifdef DEBUG
-    DBGMCU_CR = DBGMCU_CR_STOP;
-#endif
     delay(500);
 
     while (1)
     {
         gpio_set(GPIOA, GPIO2); // питание на датчики
+        ms2 = ms1 = millis();
+        gpio_set(GPIOA, GPIO3); // LED
 
+        // разрешаем прерывания
         nvic_enable_irq(NVIC_EXTI0_1_IRQ);
         nvic_enable_irq(NVIC_DMA1_CHANNEL2_3_DMA2_CHANNEL1_2_IRQ);
         nvic_enable_irq(NVIC_USART1_IRQ);
 
-        //gpio_set(GPIOA, GPIO3);
-        delay(500);
-    	adc_scanning = 1;
-    	adc_start_conversion_regular(ADC1);
-        while (!(adc_eoc(ADC1)));
-        pressure = adc_read_regular(ADC1);
-        while (!(adc_eoc(ADC1)));
-        vbat = adc_read_regular(ADC1) * 2;
-        adc_scanning = 0;
-
-        res = am2320_recv(&ds_air, AM2320_PIN1);
-        res = am2320_recv(&ds_bat, AM2320_PIN2);
-
-        if (gpio_get(GPIOB, GPIO1) != 0)
+        if (gpio_get(GPIOB, GPIO1) != 0) // если разбудил BLE - передаем имеющийся пакет
         {
             ble_connected = true;
+            uint8_t nn = 4;
+            while (ble_connected && (nn-- > 0)) // передаем до 4-х раз
+            {
+                while (transmit) {};
+                dma_write(sndbuf);
+                delay(500);
+            }
+            // BLE disconnect
+            gpio_clear(GPIOA, GPIO1); // PWRC
+            delay(200);
+            strcpy(cmdbuff, ble_dis);
+            while (transmit) {};
+            dma_write(cmdbuff);
+            delay(200);
+            gpio_set(GPIOA, GPIO1); // PWRC
+            
         }
-        else
+        else                            // разбудил будильник RTC
         {
             ble_connected = false;
-        }
-
-        if (ble_connected)
-        {
-            make_pack();
-            while (transmit) {};
-            if (ble_connected)
+            while ((ms2 - ms1) < 100) // прошло ли 100 мС после подачи питания на датчики?
             {
-              dma_write();                
+                ms2 = millis();
             }
-            delay(500);
-            gpio_toggle(GPIOA, GPIO3);
+            // читаем предварительно датчики AM2320 - эти данные не используются
+            am2320_recv(&ds_tmp, AM2320_PIN1);
+            am2320_recv(&ds_tmp, AM2320_PIN2);
+            ms1 = ms2;
+            // реальные значения надо прочитать через 2 секунды
+            // пока ждем, проверяем не произошло ли соединение по BLE
+            bool pack_sent = false;
+            while ((ms2 - ms1) < 2000)
+            {
+                ms2 = millis();
+                if (gpio_get(GPIOB, GPIO1) != 0)
+                {
+                    ble_connected = true;
+                    if (!pack_sent)
+                    {
+                        dma_write(sndbuf);
+                        pack_sent = true;
+                    }
+                }
+            }
+            // прошло 2 секунды, проводим измерения
+            am2320_recv(&ds_air, AM2320_PIN1);
+            am2320_recv(&ds_bat, AM2320_PIN2);
+
+            adc_start_conversion_regular(ADC1);
+            while (!(adc_eoc(ADC1)));
+            pressure = adc_read_regular(ADC1);
+            while (!(adc_eoc(ADC1)));
+            vbat = adc_read_regular(ADC1) * 2;
+
+            make_pack();
         }
-        else
-        {
-            gpio_clear(GPIOA, GPIO3);
-            gpio_clear(GPIOA, GPIO2);
-            gpio_set(GPIOA, GPIO5);
-            gpio_set(GPIOA, GPIO6);
 
-            timer_disable_oc_output(TIM14, TIM_OC1);
-            timer_disable_break_main_output(TIM14);
+        // теперь спать
+        while (transmit) {};    // ждем окончания передачи
+        gpio_clear(GPIOA, GPIO3);
+        gpio_clear(GPIOA, GPIO2);
+        gpio_set(GPIOA, GPIO5);
+        gpio_set(GPIOA, GPIO6);
 
-            nvic_disable_irq(NVIC_EXTI0_1_IRQ);
-            nvic_disable_irq(NVIC_DMA1_CHANNEL2_3_DMA2_CHANNEL1_2_IRQ);
-            nvic_disable_irq(NVIC_USART1_IRQ);
+        timer_disable_oc_output(TIM14, TIM_OC1);
+        timer_disable_break_main_output(TIM14);
 
-            exti_reset_request(EXTI0|EXTI1|EXTI2|EXTI3|EXTI4|EXTI5|EXTI6|EXTI7|
-                            EXTI8|EXTI9|EXTI10|EXTI11|EXTI12|EXTI13|EXTI14|EXTI15|
-                            EXTI16|EXTI17|EXTI18|EXTI19|EXTI20|EXTI21|EXTI22|EXTI23|
-                            EXTI24|EXTI25|EXTI26|EXTI27|EXTI28|EXTI29|EXTI30|EXTI31);        
+        nvic_disable_irq(NVIC_EXTI0_1_IRQ);
+        nvic_disable_irq(NVIC_DMA1_CHANNEL2_3_DMA2_CHANNEL1_2_IRQ);
+        nvic_disable_irq(NVIC_USART1_IRQ);
 
-            //pwr_set_stop_mode();
-            PWR_CR &= ~PWR_CR_PDDS;
-            //pwr_clear_wakeup_flag();
-            PWR_CR |= PWR_CR_CWUF;
-            //pwr_voltage_regulator_low_power_in_stop();
-            PWR_CR |= PWR_CR_LPDS;
-            SCB_SCR |=  (SCB_SCR_SLEEPDEEP_Msk);
-            __WFI();
+        exti_reset_request(EXTI0|EXTI1|EXTI2|EXTI3|EXTI4|EXTI5|EXTI6|EXTI7|
+                        EXTI8|EXTI9|EXTI10|EXTI11|EXTI12|EXTI13|EXTI14|EXTI15|
+                        EXTI16|EXTI17|EXTI18|EXTI19|EXTI20|EXTI21|EXTI22|EXTI23|
+                        EXTI24|EXTI25|EXTI26|EXTI27|EXTI28|EXTI29|EXTI30|EXTI31);        
 
-            // Wake up
-            clock_setup();
-            systick_setup();
-            timer_enable_oc_output(TIM14, TIM_OC1);
-            timer_enable_break_main_output(TIM14);
-            gpio_set(GPIOA, GPIO3);
-        }
+        set_new_alarm();    // заводим будильник на 2 минуты
+
+        //pwr_set_stop_mode();
+        PWR_CR &= ~PWR_CR_PDDS;
+        //pwr_clear_wakeup_flag();
+        PWR_CR |= PWR_CR_CWUF;
+        //pwr_voltage_regulator_low_power_in_stop();
+        PWR_CR |= PWR_CR_LPDS;
+        SCB_SCR |=  (SCB_SCR_SLEEPDEEP_Msk);
+#ifdef DEBUG
+        DBGMCU_CR = DBGMCU_CR_STOP;
+#endif
+        __WFI();
+
+        // Wake up
+        clock_setup();
+        systick_setup();
+        timer_enable_oc_output(TIM14, TIM_OC1);
+        timer_enable_break_main_output(TIM14);
 	}
 }
 
 // =====================================================================
+
+void set_new_alarm(void)
+{
+    RTC_get(&rtc_params);
+    uint8_t minutes = RTC_Bcd2ToByte(rtc_params.minutes) + 2;   // через 2 минуты
+    if (minutes > 59)
+    {
+        minutes -= 60;
+    }
+    rtc_params.minutes = RTC_ByteToBcd2(minutes);
+
+    RTC_alarm(&rtc_params, 0x0D); // только минуты
+
+}
 
 uint16_t get_us_value(bool state, uint16_t cnt, uint16_t pin)
 {
@@ -241,7 +301,7 @@ uint16_t get_us_value(bool state, uint16_t cnt, uint16_t pin)
     return d;
 }
 
-static uint16_t am2320_recv(am2320_s * ds, uint16_t s_pin)
+uint16_t am2320_recv(am2320_s * ds, uint16_t s_pin)
 {   
     uint8_t buf[5];
     uint16_t tcnt = 0; 
@@ -320,19 +380,24 @@ static uint16_t am2320_recv(am2320_s * ds, uint16_t s_pin)
     return result;
 } 
 
-static void make_pack(void)
+void make_pack(void)
 {
-	strcpy(sndbuf, "N");
-    strcat(sndbuf, itoa_m(pack_count++, 16));
-    strcat(sndbuf, "A");
+	//strcpy(sndbuf, "N");
+    strcpy(sndbuf, itoa_m(pack_count, 10));
+    strcat(sndbuf, "_A");
 	strcat(sndbuf, itoa_m(ds_air.temper, 10));
-	strcat(sndbuf, "B");
+	strcat(sndbuf, "_B");
 	strcat(sndbuf, itoa_m(ds_bat.temper, 10));
-	strcat(sndbuf, "P");
+	strcat(sndbuf, "_P");
 	strcat(sndbuf, itoa_m(pressure, 10));
-	strcat(sndbuf, "V");
+	strcat(sndbuf, "_V");
 	strcat(sndbuf, itoa_m(vbat, 10));
 	strcat(sndbuf, "\n");
+    pack_count++;
+    if (pack_count > 9)
+    {
+        pack_count = 0;
+    }
 }
 
 // в стандарте C99 функции itoa нет, а sprinf слишком тяжелая
@@ -385,6 +450,7 @@ static void clock_setup(void) {
     rcc_periph_clock_enable(RCC_USART1);
     rcc_periph_clock_enable(RCC_DMA);
     rcc_periph_clock_enable(RCC_ADC);
+    rcc_periph_clock_enable(RCC_PWR);
 
     // смысл тот же, что и включение тактирования AFIO в STM32F103
     // без этого прерывание по PB1 не работает,
@@ -537,14 +603,14 @@ static void usart_setup(void) {
     usart_enable(USART1);
 }
 
-static void dma_write(void)
+static void dma_write(char * buf)
 {
     // Using channel 2 for USART1_TX
     //Reset DMA channel
     dma_channel_reset(DMA1, DMA_CHANNEL2);
 
     dma_set_peripheral_address(DMA1, DMA_CHANNEL2, (uint32_t)&USART1_TDR);
-    dma_set_memory_address(DMA1, DMA_CHANNEL2, (uint32_t)sndbuf);
+    dma_set_memory_address(DMA1, DMA_CHANNEL2, (uint32_t)buf);
     dma_set_number_of_data(DMA1, DMA_CHANNEL2, strlen(sndbuf));
     dma_set_read_from_memory(DMA1, DMA_CHANNEL2);
     dma_enable_memory_increment_mode(DMA1, DMA_CHANNEL2);
@@ -615,5 +681,26 @@ void exti0_1_isr(void)
         {
             pwm_count++;
         }
+    }
+}
+
+static void rtc_isr_setup(void)
+{
+    nvic_enable_irq(NVIC_RTC_IRQ);
+    nvic_set_priority(NVIC_RTC_IRQ, 1);
+
+    exti_set_trigger(EXTI17, EXTI_TRIGGER_RISING);
+    exti_enable_request(EXTI17);
+}
+
+void rtc_isr(void)
+{
+    if(RTC_ISR & RTC_ISR_ALRAF){ // Сработал Alarm
+        
+        //GPIOA_ODR ^= GPIO_ODR_6;
+        
+        RTC_ISR &= ~(RTC_ISR_ALRAF);// Очичтим флаг прерывани ALARM
+        //EXTI_PR |= EXTI_PR_PR17; // Сбросим флаг прерывания линии EXTI
+        exti_reset_request(EXTI17);
     }
 }

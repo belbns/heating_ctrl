@@ -158,7 +158,7 @@ list: $(BINARY).list
 GENERATED_BINARIES=$(BINARY).elf $(BINARY).bin $(BINARY).hex $(BINARY).srec $(BINARY).list $(BINARY).map
 
 images: $(BINARY).images
-flash: $(BINARY).flash
+#flash: $(BINARY).flash
 
 # Either verify the user provided LDSCRIPT exists, or generate it.
 ifeq ($(strip $(DEVICE)),)
@@ -180,53 +180,64 @@ endif
 # you can type "make print-OPENCM3_DIR" and it will show you
 # how that ended up being resolved by all of the included
 # makefiles.
-print-%:
+#print-%:
+print-$(BINARY):
 	@echo $*=$($*)
 
-%.images: %.bin %.hex %.srec %.list %.map
+#%.images: %.bin %.hex %.srec %.list %.map
+$(BINARY).images: $(BINARY).bin $(BINARY).hex $(BINARY).srec $(BINARY).list $(BINARY).map
 	@#printf "*** $* images generated ***\n"
 
-%.bin: %.elf
+#%.bin: %.elf
+$(BINARY).bin: $(BINARY).elf
 	@#printf "  OBJCOPY $(*).bin\n"
 	$(Q)$(OBJCOPY) -Obinary $(*).elf $(*).bin
 
-%.hex: %.elf
+#%.hex: %.elf
+$(BINARY).hex: $(BINARY).elf
 	@#printf "  OBJCOPY $(*).hex\n"
 	$(Q)$(OBJCOPY) -Oihex $(*).elf $(*).hex
 
-%.srec: %.elf
+#%.srec: %.elf
+$(BINARY).srec: $(BINARY).elf
 	@#printf "  OBJCOPY $(*).srec\n"
 	$(Q)$(OBJCOPY) -Osrec $(*).elf $(*).srec
 
-%.list: %.elf
+#%.list: %.elf
+$(BINARY).list: $(BINARY).elf
 	@#printf "  OBJDUMP $(*).list\n"
 	$(Q)$(OBJDUMP) -S $(*).elf > $(*).list
 
-%.elf %.map: $(OBJS) $(LDSCRIPT) $(OPENCM3_DIR)/lib/lib$(LIBNAME).a
+#%.elf %
+$(BINARY).elf $(BINARY).map: $(OBJS) $(LDSCRIPT) $(OPENCM3_DIR)/lib/lib$(LIBNAME).a
 	@#printf "  LD      $(*).elf\n"
 	$(Q)$(LD) $(TGT_LDFLAGS) $(LDFLAGS) $(OBJS) $(LDLIBS) -o $(*).elf
 
-%.o: %.c
+#%.o: %.c
+$(BINARY).o: $(BINARY).c
 	@#printf "  CC      $(*).c\n"
 	$(Q)$(CC) $(TGT_CFLAGS) $(CFLAGS) $(TGT_CPPFLAGS) $(CPPFLAGS) -o $(*).o -c $(*).c
 
-%.o: %.cxx
-	@#printf "  CXX     $(*).cxx\n"
-	$(Q)$(CXX) $(TGT_CXXFLAGS) $(CXXFLAGS) $(TGT_CPPFLAGS) $(CPPFLAGS) -o $(*).o -c $(*).cxx
+#%.o: %.cxx
+#$(BINARY).o: $(BINARY).cxx
+#	@#printf "  CXX     $(*).cxx\n"
+#	$(Q)$(CXX) $(TGT_CXXFLAGS) $(CXXFLAGS) $(TGT_CPPFLAGS) $(CPPFLAGS) -o $(*).o -c $(*).cxx
 
-%.o: %.cpp
-	@#printf "  CXX     $(*).cpp\n"
-	$(Q)$(CXX) $(TGT_CXXFLAGS) $(CXXFLAGS) $(TGT_CPPFLAGS) $(CPPFLAGS) -o $(*).o -c $(*).cpp
+#%.o: %.cpp
+#$(BINARY).o: $(BINARY).cpp
+#	@#printf "  CXX     $(*).cpp\n"
+#	$(Q)$(CXX) $(TGT_CXXFLAGS) $(CXXFLAGS) $(TGT_CPPFLAGS) $(CPPFLAGS) -o $(*).o -c $(*).cpp
 
 clean:
 	@#printf "  CLEAN\n"
 	$(Q)$(RM) $(GENERATED_BINARIES) generated.* $(OBJS) $(OBJS:%.o=%.d)
 
-stylecheck: $(STYLECHECKFILES:=.stylecheck)
+#stylecheck: $(STYLECHECKFILES:=.stylecheck)
 styleclean: $(STYLECHECKFILES:=.styleclean)
 
 # the cat is due to multithreaded nature - we like to have consistent chunks of text on the output
-%.stylecheck: %
+#%.stylecheck: %
+$(BINARY).stylecheck: %
 	$(Q)$(OPENCM3_SCRIPT_DIR)$(STYLECHECK) $(STYLECHECKFLAGS) $* > $*.stylecheck; \
 		if [ -s $*.stylecheck ]; then \
 			cat $*.stylecheck; \
@@ -234,17 +245,21 @@ styleclean: $(STYLECHECKFILES:=.styleclean)
 			rm -f $*.stylecheck; \
 		fi;
 
-%.styleclean:
+#%.styleclean:
+$(BINARY).styleclean:
 	$(Q)rm -f $*.stylecheck;
 
 
-%.stlink-flash: %.bin
+#%.stlink-flash: %.bin
+#flash: %.bin
+flash: $(BINARY).bin
 	@printf "  FLASH  $<\n"
-	$(STFLASH) write $(*).bin 0x8000000
+	$(STFLASH) write $(BINARY).bin 0x8000000
 
 ifeq ($(BMP_PORT),)
 ifeq ($(OOCD_FILE),)
-%.flash: %.elf
+#%.flash: %.elf
+$(BINARY).flash: $(BINARY).elf
 	@printf "  FLASH   $<\n"
 	(echo "halt; program $(realpath $(*).elf) verify reset" | nc -4 localhost 4444 2>/dev/null) || \
 		$(OOCD) -f interface/$(OOCD_INTERFACE).cfg \
@@ -252,7 +267,8 @@ ifeq ($(OOCD_FILE),)
 		-c "program $(*).elf verify reset exit" \
 		$(NULL)
 else
-%.flash: %.elf
+#%.flash: %.elf
+$(BINARY).flash: $(BINARY).elf
 	@printf "  FLASH   $<\n"
 	(echo "halt; program $(realpath $(*).elf) verify reset" | nc -4 localhost 4444 2>/dev/null) || \
 		$(OOCD) -f $(OOCD_FILE) \
@@ -260,7 +276,8 @@ else
 		$(NULL)
 endif
 else
-%.flash: %.elf
+#%.flash: %.elf
+$(BINARY).flash: $(BINARY).elf
 	@printf "  GDB   $(*).elf (flash)\n"
 	$(GDB) --batch \
 		   -ex 'target extended-remote $(BMP_PORT)' \

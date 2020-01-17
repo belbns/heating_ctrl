@@ -1,3 +1,6 @@
+/*
+  Thanks to denigrim article (https://denigrim.livejournal.com/34580.html)
+*/
 #ifndef _MRTC_H_
 #define _MRTC_H_
 
@@ -20,16 +23,16 @@ typedef struct {
 
 
 void RTC_init(void);
-void RTC_set (RTC_struct *value);
-void RTC_sets (RTC_struct *value);
+void RTC_set(RTC_struct *value);
+void RTC_sets(RTC_struct *value);
 void RTC_get(RTC_struct * value);
+void RTC_change(RTC_struct *value);
 void RTC_alarm(RTC_struct *value, uint8_t msk);
 
-void RTC_IRQHandler(void);
 uint8_t RTC_ByteToBcd2(uint8_t Value);
 uint8_t RTC_Bcd2ToByte(uint8_t Value);
-uint8_t RTC_Bcd_elder(uint8_t value);
-uint8_t RTC_Bcd_under(uint8_t value);
+//uint8_t RTC_Bcd_elder(uint8_t value);
+//uint8_t RTC_Bcd_under(uint8_t value);
 
 
 #endif
