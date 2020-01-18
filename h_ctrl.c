@@ -70,7 +70,7 @@ char * itoa_m(int val, int base);
 #define PWRC_PORT   GPIOA
 #define PWRC_PIN    GPIO1 // 0 - для ввода AT команд в режиме соединения
 
-#define PACK_SZ	20
+#define PACK_SZ	100
 
 #define DEBUG
 
@@ -105,7 +105,7 @@ uint8_t pack_count = 0;
 
 uint8_t rxindex = 0;
 uint8_t flag_cmd = 0;
-uint8_t transmit = 0;
+bool transmit = false;
 bool ble_connected = false;
 bool trans_en = false;
 
@@ -151,7 +151,19 @@ int main(void)
     set_new_alarm();
     rtc_isr_setup();
 
-    delay(500);
+    gpio_set(GPIOA, GPIO2); // питание на датчики
+	am2320_recv(&ds_tmp, AM2320_PIN1);
+    am2320_recv(&ds_tmp, AM2320_PIN2);
+
+    // задержка для программатора
+    for (uint8_t i = 0; i < 5; i++)
+    {
+    	gpio_set(GPIOA, GPIO3); // LED
+    	delay(200);
+    	gpio_clear(GPIOA, GPIO3);
+    	delay(200);
+    }
+    make_pack();
 
     while (1)
     {
@@ -167,20 +179,21 @@ int main(void)
         if (gpio_get(GPIOB, GPIO1) != 0) // если разбудил BLE - передаем имеющийся пакет
         {
             ble_connected = true;
-            uint8_t nn = 4;
-            while (ble_connected && (nn-- > 0)) // передаем до 4-х раз
+            uint8_t nn = 5;
+            while ((--nn > 0) && ble_connected) // передаем до 4-х раз
             {
+                delay(500);
                 while (transmit) {};
                 dma_write(sndbuf);
-                delay(500);
             }
+            delay(500);
+            while (transmit) {};
             // BLE disconnect
             gpio_clear(GPIOA, GPIO1); // PWRC
             delay(200);
             strcpy(cmdbuff, ble_dis);
-            while (transmit) {};
             dma_write(cmdbuff);
-            delay(200);
+            delay(500);
             gpio_set(GPIOA, GPIO1); // PWRC
             
         }
@@ -206,26 +219,21 @@ int main(void)
                     ble_connected = true;
                     if (!pack_sent)
                     {
+                    	delay(500);
                         dma_write(sndbuf);
                         pack_sent = true;
                     }
                 }
             }
             // прошло 2 секунды, проводим измерения
-            am2320_recv(&ds_air, AM2320_PIN1);
-            am2320_recv(&ds_bat, AM2320_PIN2);
-
-            adc_start_conversion_regular(ADC1);
-            while (!(adc_eoc(ADC1)));
-            pressure = adc_read_regular(ADC1);
-            while (!(adc_eoc(ADC1)));
-            vbat = adc_read_regular(ADC1) * 2;
-
             make_pack();
         }
-
+        transmit = false;
         // теперь спать
-        while (transmit) {};    // ждем окончания передачи
+        //while (transmit) {};    // ждем окончания передачи
+        //gpio_clear(GPIOA, GPIO3);
+        //delay(1000);
+        
         gpio_clear(GPIOA, GPIO3);
         gpio_clear(GPIOA, GPIO2);
         gpio_set(GPIOA, GPIO5);
@@ -252,16 +260,18 @@ int main(void)
         //pwr_voltage_regulator_low_power_in_stop();
         PWR_CR |= PWR_CR_LPDS;
         SCB_SCR |=  (SCB_SCR_SLEEPDEEP_Msk);
-#ifdef DEBUG
-        DBGMCU_CR = DBGMCU_CR_STOP;
-#endif
+//#ifdef DEBUG
+//        DBGMCU_CR = DBGMCU_CR_STOP;
+//#endif
         __WFI();
 
         // Wake up
         clock_setup();
         systick_setup();
+        timer_enable_counter(TIM16);
         timer_enable_oc_output(TIM14, TIM_OC1);
         timer_enable_break_main_output(TIM14);
+        
 	}
 }
 
@@ -382,7 +392,16 @@ uint16_t am2320_recv(am2320_s * ds, uint16_t s_pin)
 
 void make_pack(void)
 {
-	//strcpy(sndbuf, "N");
+	// измерения
+	am2320_recv(&ds_air, AM2320_PIN1);
+    am2320_recv(&ds_bat, AM2320_PIN2);
+
+    adc_start_conversion_regular(ADC1);
+    while (!(adc_eoc(ADC1)));
+    pressure = adc_read_regular(ADC1);
+    while (!(adc_eoc(ADC1)));
+    vbat = adc_read_regular(ADC1) * 2;
+
     strcpy(sndbuf, itoa_m(pack_count, 10));
     strcat(sndbuf, "_A");
 	strcat(sndbuf, itoa_m(ds_air.temper, 10));
@@ -392,7 +411,7 @@ void make_pack(void)
 	strcat(sndbuf, itoa_m(pressure, 10));
 	strcat(sndbuf, "_V");
 	strcat(sndbuf, itoa_m(vbat, 10));
-	strcat(sndbuf, "\n");
+	strcat(sndbuf, "\n\0");
     pack_count++;
     if (pack_count > 9)
     {
@@ -605,13 +624,14 @@ static void usart_setup(void) {
 
 static void dma_write(char * buf)
 {
+	transmit = true;
     // Using channel 2 for USART1_TX
     //Reset DMA channel
     dma_channel_reset(DMA1, DMA_CHANNEL2);
 
     dma_set_peripheral_address(DMA1, DMA_CHANNEL2, (uint32_t)&USART1_TDR);
     dma_set_memory_address(DMA1, DMA_CHANNEL2, (uint32_t)buf);
-    dma_set_number_of_data(DMA1, DMA_CHANNEL2, strlen(sndbuf));
+    dma_set_number_of_data(DMA1, DMA_CHANNEL2, strlen(buf));
     dma_set_read_from_memory(DMA1, DMA_CHANNEL2);
     dma_enable_memory_increment_mode(DMA1, DMA_CHANNEL2);
     dma_set_peripheral_size(DMA1, DMA_CHANNEL2, DMA_CCR_PSIZE_8BIT);
@@ -633,7 +653,7 @@ void dma1_channel2_3_dma2_channel1_2_isr(void)
     dma_disable_transfer_complete_interrupt(DMA1, DMA_CHANNEL2);
     usart_disable_tx_dma(USART1);
     dma_disable_channel(DMA1, DMA_CHANNEL2);
-    transmit = 0;
+    transmit = false;
 }
 
 // USART1 RX interrupt
