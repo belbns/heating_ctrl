@@ -58,6 +58,7 @@ void delay(uint64_t duration);
 void make_pack(void);
 uint16_t am2320_recv(am2320_s * ds, uint16_t s_pin);
 void set_new_alarm(void);
+void send_pack(char *sbuf, uint8_t ii);
 
 uint16_t get_us_value(bool state, uint16_t cnt, uint16_t pin);
 
@@ -96,9 +97,11 @@ am2320_s ds_tmp = {.humidity = 0, .temper =0};
 RTC_struct rtc_params = {.year = 20, .month = 1, .week = 3, .day = 1, 
                             .hour = 0, .minutes = 0, .seconds = 0};
 
-char sndbuf[PACK_SZ + 4];
-char rxbuff[PACK_SZ + 4];
-char cmdbuff[PACK_SZ + 4];
+char sndbuf[PACK_SZ];
+char rxbuff[PACK_SZ];
+char cmdbuff[PACK_SZ];
+char tx_buf[PACK_SZ];
+
 uint8_t channel_array[] = {7, 18};
 
 uint8_t pack_count = 0;
@@ -148,7 +151,6 @@ int main(void)
     }
     */
     RTC_sets(&rtc_params);
-    set_new_alarm();
     rtc_isr_setup();
 
     gpio_set(GPIOA, GPIO2); // питание на датчики
@@ -164,6 +166,7 @@ int main(void)
     	delay(200);
     }
     make_pack();
+    set_new_alarm();
 
     while (1)
     {
@@ -179,23 +182,14 @@ int main(void)
         if (gpio_get(GPIOB, GPIO1) != 0) // если разбудил BLE - передаем имеющийся пакет
         {
             ble_connected = true;
-            uint8_t nn = 5;
-            while ((--nn > 0) && ble_connected) // передаем до 4-х раз
+            // После пробуждения по STAT надо выждать 1 секунду!
+            delay(1000);
+            uint8_t nn = 4;
+            while ((nn-- > 0) && (gpio_get(GPIOB, GPIO1) != 0)) // передаем до 4-х раз
             {
+                send_pack(sndbuf, nn);
                 delay(500);
-                while (transmit) {};
-                dma_write(sndbuf);
             }
-            delay(500);
-            while (transmit) {};
-            // BLE disconnect
-            gpio_clear(GPIOA, GPIO1); // PWRC
-            delay(200);
-            strcpy(cmdbuff, ble_dis);
-            dma_write(cmdbuff);
-            delay(500);
-            gpio_set(GPIOA, GPIO1); // PWRC
-            
         }
         else                            // разбудил будильник RTC
         {
@@ -210,30 +204,37 @@ int main(void)
             ms1 = ms2;
             // реальные значения надо прочитать через 2 секунды
             // пока ждем, проверяем не произошло ли соединение по BLE
-            bool pack_sent = false;
+            delay(200);
             while ((ms2 - ms1) < 2000)
             {
                 ms2 = millis();
+                uint8_t nn = 9;
                 if (gpio_get(GPIOB, GPIO1) != 0)
                 {
                     ble_connected = true;
-                    if (!pack_sent)
-                    {
-                    	delay(500);
-                        dma_write(sndbuf);
-                        pack_sent = true;
-                    }
+					send_pack(sndbuf, nn--);
+                   	delay(500);
                 }
             }
             // прошло 2 секунды, проводим измерения
             make_pack();
+			set_new_alarm();    // заводим будильник на 2 минуты
         }
-        transmit = false;
-        // теперь спать
-        //while (transmit) {};    // ждем окончания передачи
-        //gpio_clear(GPIOA, GPIO3);
-        //delay(1000);
-        
+
+        while (transmit) {};
+
+        // BLE disconnect
+        if (gpio_get(GPIOB, GPIO1) != 0)	// все еще есть соединение
+        {
+        	gpio_clear(GPIOA, GPIO1); // PWRC=0 - AT mode
+            delay(200);
+            strcpy(cmdbuff, ble_dis);
+            dma_write(cmdbuff);
+            delay(500);
+            gpio_set(GPIOA, GPIO1); // PWRC
+        }
+        while (transmit) {};
+
         gpio_clear(GPIOA, GPIO3);
         gpio_clear(GPIOA, GPIO2);
         gpio_set(GPIOA, GPIO5);
@@ -251,8 +252,6 @@ int main(void)
                         EXTI16|EXTI17|EXTI18|EXTI19|EXTI20|EXTI21|EXTI22|EXTI23|
                         EXTI24|EXTI25|EXTI26|EXTI27|EXTI28|EXTI29|EXTI30|EXTI31);        
 
-        set_new_alarm();    // заводим будильник на 2 минуты
-
         //pwr_set_stop_mode();
         PWR_CR &= ~PWR_CR_PDDS;
         //pwr_clear_wakeup_flag();
@@ -260,9 +259,6 @@ int main(void)
         //pwr_voltage_regulator_low_power_in_stop();
         PWR_CR |= PWR_CR_LPDS;
         SCB_SCR |=  (SCB_SCR_SLEEPDEEP_Msk);
-//#ifdef DEBUG
-//        DBGMCU_CR = DBGMCU_CR_STOP;
-//#endif
         __WFI();
 
         // Wake up
@@ -270,8 +266,7 @@ int main(void)
         systick_setup();
         timer_enable_counter(TIM16);
         timer_enable_oc_output(TIM14, TIM_OC1);
-        timer_enable_break_main_output(TIM14);
-        
+        timer_enable_break_main_output(TIM14);        
 	}
 }
 
@@ -288,7 +283,6 @@ void set_new_alarm(void)
     rtc_params.minutes = RTC_ByteToBcd2(minutes);
 
     RTC_alarm(&rtc_params, 0x0D); // только минуты
-
 }
 
 uint16_t get_us_value(bool state, uint16_t cnt, uint16_t pin)
@@ -389,6 +383,15 @@ uint16_t am2320_recv(am2320_s * ds, uint16_t s_pin)
 
     return result;
 } 
+
+void  send_pack(char *sbuf, uint8_t ii)
+{
+	strcpy(tx_buf, itoa_m(ii, 10));
+    strcat(tx_buf, "_");
+    strcat(tx_buf, sbuf);
+    while (transmit) {};
+    dma_write(tx_buf);
+}
 
 void make_pack(void)
 {
