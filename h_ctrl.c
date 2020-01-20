@@ -6,7 +6,6 @@
 */
 
 #include <errno.h>
-//#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
@@ -29,6 +28,20 @@
 #include <libopencm3/cm3/scb.h>
 
 #include "rtc.h"
+
+#define AM2320_PORT GPIOA
+#define AM2320_PIN1 GPIO5
+#define AM2320_PIN2 GPIO6
+#define PWRC_PORT   GPIOA
+#define PWRC_PIN    GPIO1 // 0 - для ввода AT команд в режиме соединения
+#define STAT_PORT   GPIOB
+#define STAT_PIN    GPIO1 // 1 - connected
+
+#define PACK_SZ 24
+
+#define TEMP_ALARM 150        // 15 градусов и ниже - авария
+#define PRESS_ALARM 646       // 1 bar (при Vcc= 2.8..3V) и ниже - авария
+#define VBAT_ALARM 3220       // 2.6V
 
 typedef struct {
     union {
@@ -54,27 +67,13 @@ static void rtc_isr_setup(void);
 
 uint64_t millis(void);
 void delay(uint64_t duration);
+uint16_t get_us_value(bool state, uint16_t cnt, uint16_t pin);
+char * itoa_m(int val, int base);
 
 void make_pack(void);
 uint16_t am2320_recv(am2320_s * ds, uint16_t s_pin);
 void set_new_alarm(void);
-void send_pack(char *sbuf, uint8_t ii);
-
-uint16_t get_us_value(bool state, uint16_t cnt, uint16_t pin);
-
-char * itoa_m(int val, int base);
-
-
-#define AM2320_PORT GPIOA
-#define AM2320_PIN1 GPIO5
-#define AM2320_PIN2 GPIO6
-#define PWRC_PORT   GPIOA
-#define PWRC_PIN    GPIO1 // 0 - для ввода AT команд в режиме соединения
-
-#define PACK_SZ	100
-
-#define DEBUG
-
+void send_pack(char * sbuf);
 
 // Команды BLE JDY-16
 // пробуждение по соединению
@@ -90,6 +89,8 @@ const char ble_pwm_on[] = "AT+PWMOPEN1\r\n";
 const char ble_pwm_off[] = "AT+PWMOPEN0\r\n";
 const char ble_dis[] = "AT+DISC\r\n";
 
+uint8_t channel_array[] = {7, 18};  // для АЦП: Pressure sensor, VBAT
+
 am2320_s ds_air = {.humidity = 0, .temper =0};
 am2320_s ds_bat = {.humidity = 0, .temper =0};
 am2320_s ds_tmp = {.humidity = 0, .temper =0};
@@ -97,12 +98,10 @@ am2320_s ds_tmp = {.humidity = 0, .temper =0};
 RTC_struct rtc_params = {.year = 20, .month = 1, .week = 3, .day = 1, 
                             .hour = 0, .minutes = 0, .seconds = 0};
 
-char sndbuf[PACK_SZ];
+char airbuf[PACK_SZ];
+char batbuf[PACK_SZ];
 char rxbuff[PACK_SZ];
 char cmdbuff[PACK_SZ];
-char tx_buf[PACK_SZ];
-
-uint8_t channel_array[] = {7, 18};
 
 uint8_t pack_count = 0;
 
@@ -110,12 +109,8 @@ uint8_t rxindex = 0;
 uint8_t flag_cmd = 0;
 bool transmit = false;
 bool ble_connected = false;
-bool trans_en = false;
-
+bool flag_alarm = 0;
 uint16_t pwm_count = 0;
-uint8_t	adc_scanning = 0;  
-uint8_t adc_error = 0;  
-uint8_t adc_new_val = 0;
 
 static volatile int16_t t_air = 0;
 static volatile int16_t t_bat = 0;
@@ -187,8 +182,17 @@ int main(void)
             uint8_t nn = 4;
             while ((nn-- > 0) && (gpio_get(GPIOB, GPIO1) != 0)) // передаем до 4-х раз
             {
-                send_pack(sndbuf, nn);
-                delay(500);
+                if (flag_alarm) // beep
+                {
+                    timer_enable_counter(TIM14);
+                }
+                send_pack(batbuf);
+                delay(250);
+
+                timer_disable_counter(TIM14);
+
+                send_pack(airbuf);
+                delay(250);
             }
         }
         else                            // разбудил будильник RTC
@@ -208,16 +212,28 @@ int main(void)
             while ((ms2 - ms1) < 2000)
             {
                 ms2 = millis();
-                uint8_t nn = 9;
                 if (gpio_get(GPIOB, GPIO1) != 0)
                 {
                     ble_connected = true;
-					send_pack(sndbuf, nn--);
-                   	delay(500);
+					send_pack(batbuf);
+                   	delay(250);
+                    send_pack(airbuf);
+                    delay(250);
                 }
             }
             // прошло 2 секунды, проводим измерения
             make_pack();
+            if (flag_alarm)
+            {
+                for (uint8_t i = 0; i < 5; i++)
+                {
+                    timer_enable_counter(TIM14);
+                    delay(1000);
+                    timer_disable_counter(TIM14);
+                    delay(1000);
+                }       
+            }
+
 			set_new_alarm();    // заводим будильник на 2 минуты
         }
 
@@ -235,8 +251,8 @@ int main(void)
         }
         while (transmit) {};
 
-        gpio_clear(GPIOA, GPIO3);
         gpio_clear(GPIOA, GPIO2);
+        gpio_clear(GPIOA, GPIO3);
         gpio_set(GPIOA, GPIO5);
         gpio_set(GPIOA, GPIO6);
 
@@ -384,13 +400,10 @@ uint16_t am2320_recv(am2320_s * ds, uint16_t s_pin)
     return result;
 } 
 
-void  send_pack(char *sbuf, uint8_t ii)
+void  send_pack(char * sbuf)
 {
-	strcpy(tx_buf, itoa_m(ii, 10));
-    strcat(tx_buf, "_");
-    strcat(tx_buf, sbuf);
     while (transmit) {};
-    dma_write(tx_buf);
+    dma_write(sbuf);
 }
 
 void make_pack(void)
@@ -405,18 +418,60 @@ void make_pack(void)
     while (!(adc_eoc(ADC1)));
     vbat = adc_read_regular(ADC1) * 2;
 
-    strcpy(sndbuf, itoa_m(pack_count, 10));
-    strcat(sndbuf, "_A");
-	strcat(sndbuf, itoa_m(ds_air.temper, 10));
-	strcat(sndbuf, "_B");
-	strcat(sndbuf, itoa_m(ds_bat.temper, 10));
-	strcat(sndbuf, "_P");
-	strcat(sndbuf, itoa_m(pressure, 10));
-	strcat(sndbuf, "_V");
-	strcat(sndbuf, itoa_m(vbat, 10));
-	strcat(sndbuf, "\n\0");
+    if ((pressure < PRESS_ALARM) || (ds_bat.temper < TEMP_ALARM))
+    // "Ann:-ttt:hhh:AP\n" - 1-й пакет
+    strcpy(airbuf, "A");
+    strcat(airbuf, itoa_m(pack_count, 10));
+    strcat(airbuf, ":");
+    int16_t t = (int16_t)(ds_air.temper & 0x7FFF);
+    if ((ds_air.temper & 0x8000) != 0) // отрицательная температура
+    {
+        t = -t;
+    }
+    strcat(airbuf, itoa_m(t, 10));
+    strcat(airbuf, ":");
+    strcat(airbuf, itoa_m(ds_air.humidity, 10));
+    strcat(airbuf, ":");
+    if (pressure < PRESS_ALARM)
+    {
+        strcat(airbuf, "AP");
+        flag_alarm = true;
+    }
+    else if (ds_bat.temper < TEMP_ALARM)
+    {
+        strcat(airbuf, "AT");   
+        flag_alarm = true;
+    }
+    else if (vbat < VBAT_ALARM)
+    {
+        strcat(airbuf, "AB");   
+        flag_alarm = true;
+    }
+    else
+    {
+        strcat(airbuf, "NN");   
+        flag_alarm = false;
+    }
+    strcat(airbuf, "\n");
+
+    // "Bnn:-ttt:pppp:vvvv\n" - 2-й пакет
+    strcpy(batbuf, "B");
+    strcat(batbuf, itoa_m(pack_count, 10));
+    strcat(batbuf, ":");
+    t = (int16_t)(ds_bat.temper & 0x7FFF);
+    if ((ds_bat.temper & 0x8000) != 0) // отрицательная температура
+    {
+        t = -t;
+    }
+    strcat(batbuf, itoa_m(t, 10));
+    strcat(batbuf, ":");
+    strcat(batbuf, itoa_m(pressure, 10));
+    strcat(batbuf, ":");
+    strcat(batbuf, itoa_m(vbat, 10));
+    strcat(batbuf, "\n");
+
     pack_count++;
-    if (pack_count > 9)
+    if (pack_count > 99)
     {
         pack_count = 0;
     }
@@ -551,7 +606,7 @@ static void tim14_setup(void) {
     //timer_enable_counter(TIM14);
 }
 
-// measuring ir signal period
+// для измерения микросекундных интервалов
 static void tim16_setup(void) {
     rcc_periph_clock_enable(RCC_TIM16);
 
@@ -586,23 +641,6 @@ static void adc_setup(void)
     }
 }
 
-void dma1_channel1_isr(void)
-{
-    if ((DMA1_ISR & DMA_IFCR_CTCIF1) != 0) // Tranfer complete flag
-    {
-        DMA1_IFCR |= DMA_IFCR_CTCIF1;
-		adc_scanning = 0;
-		adc_new_val = 1;  
-    }
-    
-    if ((DMA1_ISR & DMA_IFCR_CTEIF1) != 0) // Tranfer error flag
-    {
-        DMA1_IFCR |= DMA_IFCR_CTEIF1;
-		adc_scanning = 0;  
-		adc_error = 1;  
-    }
-}
-
 static void usart_setup(void) {
     nvic_set_priority(NVIC_DMA1_CHANNEL2_3_DMA2_CHANNEL1_2_IRQ, 0);
     nvic_enable_irq(NVIC_DMA1_CHANNEL2_3_DMA2_CHANNEL1_2_IRQ);
@@ -628,8 +666,7 @@ static void usart_setup(void) {
 static void dma_write(char * buf)
 {
 	transmit = true;
-    // Using channel 2 for USART1_TX
-    //Reset DMA channel
+    // channel 2 for USART1_TX
     dma_channel_reset(DMA1, DMA_CHANNEL2);
 
     dma_set_peripheral_address(DMA1, DMA_CHANNEL2, (uint32_t)&USART1_TDR);
