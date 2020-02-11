@@ -3,6 +3,19 @@
  *
  * Tools: Linux Mint, gcc-arm-none-eabi, OpenOCD, LIBOPENCM3, Sublime Text.
  *
+
+    Через BLE передается 2 пакета
+    1-й:    "Ann:-ttt:hhh:AP\n" - атмосферные параметры (в комнате),
+                где nn - счетчик пакетов (0..99),
+                ttt - температура,
+                hhh - влажность,
+                A[PTB]  - наличие тревоги по давлению, температуре, разряду батареи
+                или NN - отсутствие проблем.
+    2-й     "Bnn:-ttt:pppp:vvvv\n" - парамтры отопления,
+                где nn - счетчик пакетов (тот же),
+                ttt - температура,
+                ppp - давление,
+                vvvv - напряжение питания
 */
 
 #include <errno.h>
@@ -29,9 +42,12 @@
 
 #include "rtc.h"
 
-#define AM2320_PORT GPIOA
+#define SENSOR_PORT GPIOA
 #define AM2320_PIN1 GPIO5
 #define AM2320_PIN2 GPIO6
+#define PRESS_PIN   GPIO7
+#define SPEAKER_PIN GPIO4
+
 #define PWRC_PORT   GPIOA
 #define PWRC_PIN    GPIO1 // 0 - для ввода AT команд в режиме соединения
 #define STAT_PORT   GPIOB
@@ -131,8 +147,8 @@ int main(void)
     clock_setup();
     systick_setup();
     gpio_setup();
-    gpio_set(AM2320_PORT, AM2320_PIN1);
-    gpio_set(AM2320_PORT, AM2320_PIN2);
+    gpio_set(SENSOR_PORT, AM2320_PIN1);
+    gpio_set(SENSOR_PORT, AM2320_PIN2);
     gpio_set(GPIOA, GPIO1); // PWRC
     adc_setup();
     tim14_setup();
@@ -305,7 +321,7 @@ uint16_t get_us_value(bool state, uint16_t cnt, uint16_t pin)
 {
     uint16_t tb = timer_get_counter(TIM16);
     uint16_t d = 0;
-    while (((gpio_get(AM2320_PORT, pin) != 0) == state) && (d < cnt))
+    while (((gpio_get(SENSOR_PORT, pin) != 0) == state) && (d < cnt))
     {
         uint16_t tc = timer_get_counter(TIM16);
         if (tc < tb)
@@ -328,13 +344,13 @@ uint16_t am2320_recv(am2320_s * ds, uint16_t s_pin)
     uint16_t result = 0;
 
     // Поднимем ногу датчика к питанию для включения режима 
-    gpio_set(AM2320_PORT, s_pin);
+    gpio_set(SENSOR_PORT, s_pin);
     delay(100); 
     // прижимаем пин к земле на 5mS - "Tbe"
-    gpio_clear(AM2320_PORT, s_pin);    
+    gpio_clear(SENSOR_PORT, s_pin);    
     delay(5); 
     // отпустим пин 
-    gpio_set(AM2320_PORT, s_pin);
+    gpio_set(SENSOR_PORT, s_pin);
     // ждем появления нуля  - "Tgo"
     tcnt = get_us_value(true, 200, s_pin); // 20..200 uS
     //Tgo = tcnt;
