@@ -105,6 +105,12 @@ const char ble_pwm_on[] = "AT+PWMOPEN1\r\n";
 const char ble_pwm_off[] = "AT+PWMOPEN0\r\n";
 const char ble_dis[] = "AT+DISC\r\n";
 
+// первоначальная конфигурация
+const char ble_at[] = "AT+AT\r\n";
+const char ble_baud[] = "AT+BAUD8r\n";
+const char ble_name[] = "AT+NAMEHEAT35\r\n";
+
+
 uint8_t channel_array[] = {7, 18};  // для АЦП: Pressure sensor, VBAT
 
 am2320_s ds_air = {.humidity = 0, .temper =0};
@@ -165,8 +171,8 @@ int main(void)
     rtc_isr_setup();
 
     gpio_set(GPIOA, GPIO2); // питание на датчики
-	am2320_recv(&ds_tmp, AM2320_PIN1);
-    am2320_recv(&ds_tmp, AM2320_PIN2);
+	//am2320_recv(&ds_tmp, AM2320_PIN1);
+    //am2320_recv(&ds_tmp, AM2320_PIN2);
 
     // задержка для программатора
     for (uint8_t i = 0; i < 5; i++)
@@ -176,6 +182,27 @@ int main(void)
     	gpio_clear(GPIOA, GPIO3);
     	delay(200);
     }
+
+    // начальная инициализация - после скорость надо поменять на 115200
+            // разрешаем прерывания
+    nvic_enable_irq(NVIC_EXTI0_1_IRQ);
+    nvic_enable_irq(NVIC_DMA1_CHANNEL2_3_DMA2_CHANNEL1_2_IRQ);
+    nvic_enable_irq(NVIC_USART1_IRQ);
+
+    gpio_clear(GPIOA, GPIO1); // PWRC=0 - AT mode
+    delay(500);
+    strcpy(cmdbuff, ble_at);
+    dma_write(cmdbuff);
+    delay(500);
+    strcpy(cmdbuff, ble_name);
+    dma_write(cmdbuff);
+    delay(500);
+    strcpy(cmdbuff, ble_baud);
+    dma_write(cmdbuff);
+    delay(250);
+    gpio_set(GPIOA, GPIO1); // PWRC
+    
+
     make_pack();
     set_new_alarm();
 
@@ -650,11 +677,12 @@ static void adc_setup(void)
     adc_disable_analog_watchdog(ADC1);
     adc_power_on(ADC1);
 
-    /* Wait for ADC starting up. */
+    /* Wait for ADC starting up. 
     int i;
-    for (i = 0; i < 800000; i++) {    /* Wait a bit. */
+    for (i = 0; i < 800000; i++) {    // Wait a bit.
         __asm__("nop");
     }
+    */
 }
 
 static void usart_setup(void) {
@@ -667,7 +695,8 @@ static void usart_setup(void) {
     gpio_mode_setup(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO10);
     gpio_set_af(GPIOA, GPIO_AF1, GPIO10);
 
-    usart_set_baudrate(USART1, 115200);
+    //usart_set_baudrate(USART1, 115200);
+    usart_set_baudrate(USART1, 9600);
     usart_set_databits(USART1, 8);
     usart_set_stopbits(USART1, USART_STOPBITS_1);
     usart_set_parity(USART1, USART_PARITY_NONE);
